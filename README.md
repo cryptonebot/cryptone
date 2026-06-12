@@ -1,0 +1,2 @@
+# cryptone
+trading perps
