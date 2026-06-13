@@ -1,7 +1,7 @@
 name: Test Bot Scan
 
 on:
-  workflow_dispatch:    # Manual run only
+  workflow_dispatch:
 
 jobs:
   test-scan:
@@ -20,22 +20,27 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
+          pip list  # DEBUG: cek module terinstall
 
-      - name: Run single scan (entry alert)
+      - name: Run single scan
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           DEBUG: true
         run: |
           python -c "
-          import os, time, threading
+          import os, time, sys
+          print('Python path:', sys.executable)
+          print('Installed packages:')
+          import pkg_resources
+          for dist in pkg_resources.working_set:
+              print(f'  {dist.project_name} {dist.version}')
           
-          # Set flag untuk mode test
           os.environ['GITHUB_ACTIONS'] = 'true'
           
           # Import bot
           exec(open('bot.py').read())
           
-          # Jalankan satu kali scan entry alert
+          # Run scans
           print('🚀 Running entry alert scan...')
           check_entry_alert()
           print('✅ Entry alert scan done')
