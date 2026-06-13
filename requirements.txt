@@ -1,6 +1,0 @@
-pyTelegramBotAPI==4.16.0
-requests==2.32.3
-schedule==1.2.0
-numpy==1.26.3
-hyperliquid-python-sdk==0.16.0
-python-dotenv==1.0.1
