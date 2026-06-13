@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv/
+env/
+ENV/
+.venv
+
+# Bot specific - JANGAN DI COMMIT!
+*.db
+*.db-journal
+*.json
+!requirements.txt
+!docker-compose.yml
+!Dockerfile
+!package.json
+bot_log.txt
+bot_debug.txt
+*.tmp
+*.log
+*.pid
+nohup.out
+
+# Data & Logs
+/data/
+/logs/
+
+# Secrets - PALING PENTING!
+.env
+.env.local
+.env.*
+secret.txt
+secret.json
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+Desktop.ini
+
+# GitHub Actions temporary
+.github/workflows/temp/
