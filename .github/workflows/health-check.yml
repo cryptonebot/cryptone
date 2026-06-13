@@ -1,0 +1,15 @@
+name: Health Check
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'   # Setiap 20 menit
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log health check
+        run: |
+          echo "✅ Health check triggered at $(date)"
+          echo "Bot should be running on your VPS with token from secrets"
