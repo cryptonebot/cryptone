@@ -1,5 +1,0 @@
-requests
-pyTelegramBotAPI
-schedule
-hyperliquid-python-sdk
-numpy
