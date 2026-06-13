@@ -1,0 +1,50 @@
+name: Test Bot Scan
+
+on:
+  workflow_dispatch:    # Manual run only
+
+jobs:
+  test-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run single scan (entry alert)
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DEBUG: true
+        run: |
+          python -c "
+          import os, time, threading
+          
+          # Set flag untuk mode test
+          os.environ['GITHUB_ACTIONS'] = 'true'
+          
+          # Import bot
+          exec(open('bot.py').read())
+          
+          # Jalankan satu kali scan entry alert
+          print('🚀 Running entry alert scan...')
+          check_entry_alert()
+          print('✅ Entry alert scan done')
+          
+          print('🚀 Running squeeze alert scan...')
+          check_squeeze_alert()
+          print('✅ Squeeze alert scan done')
+          
+          print('🚀 Running warroom scan...')
+          check_warroom_simple()
+          print('✅ Warroom scan done')
+          "
