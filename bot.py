@@ -48,6 +48,27 @@ def global_exception_handler(exctype, value, tb):
 
 sys.excepthook = global_exception_handler
 
+# ========== GITHUB ACTIONS MODE ==========
+# Ini harus DILAKUKAN SEBELUM handler didefinisikan
+if os.environ.get('GITHUB_ACTIONS') == 'true':
+    print("🚀 Running in GitHub Actions mode - single scan only")
+    
+    # Inisialisasi bot (wajib sebelum handler)
+    bot = telebot.TeleBot(TOKEN)
+    
+    # Jalankan scanner
+    print("🔄 Running entry alert scan...")
+    check_entry_alert()
+    
+    print("🔄 Running squeeze alert scan...")
+    check_squeeze_alert()
+    
+    print("🔄 Running warroom scan...")
+    check_warroom_simple()
+    
+    print("✅ Scan completed. Exiting.")
+    sys.exit(0)
+
 # ========== REALISTIC CONFIDENCE LIMITS ==========
 MAX_CONFIDENCE_BY_SOURCE = {
     "smc": 85,
