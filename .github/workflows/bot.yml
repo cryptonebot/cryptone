@@ -18,6 +18,19 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - run: chmod +x run.sh && ./run.sh
+      
+      - name: Debug token
+        run: |
+          if [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ]; then
+            echo "✅ Token exists (length: ${#TOKEN})"
+          else
+            echo "❌ Token NOT found in secrets!"
+          fi
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      
+      - name: Run bot
+        run: python bot.py
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GITHUB_ACTIONS: "true"
