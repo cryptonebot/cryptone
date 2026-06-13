@@ -20,36 +20,59 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-          pip list  # DEBUG: cek module terinstall
 
       - name: Run single scan
         env:
           TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          DEBUG: true
         run: |
-          python -c "
-          import os, time, sys
-          print('Python path:', sys.executable)
-          print('Installed packages:')
-          import pkg_resources
-          for dist in pkg_resources.working_set:
-              print(f'  {dist.project_name} {dist.version}')
-          
-          os.environ['GITHUB_ACTIONS'] = 'true'
-          
-          # Import bot
-          exec(open('bot.py').read())
-          
-          # Run scans
-          print('🚀 Running entry alert scan...')
-          check_entry_alert()
-          print('✅ Entry alert scan done')
-          
-          print('🚀 Running squeeze alert scan...')
-          check_squeeze_alert()
-          print('✅ Squeeze alert scan done')
-          
-          print('🚀 Running warroom scan...')
-          check_warroom_simple()
-          print('✅ Warroom scan done')
-          "
+          echo "TOKEN length: ${#TOKEN}"  # Debug: cek token ada
+          python << 'EOF'
+import os
+import sys
+
+# Force set environment variable
+token = os.environ.get('TOKEN')
+if not token:
+    # Try to get from different method
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    
+if not token:
+    print("❌ No token found in environment")
+    print("Available env vars:", list(os.environ.keys()))
+    sys.exit(1)
+
+print(f"✅ Token found, length: {len(token)}")
+
+# Set TOKEN explicitly
+os.environ['TOKEN'] = token
+
+# Now import and run bot module
+import time
+
+# Read bot.py content and execute
+with open('bot.py', 'r') as f:
+    bot_code = f.read()
+
+exec(bot_code)
+
+print("🚀 Running entry alert scan...")
+try:
+    check_entry_alert()
+    print("✅ Entry alert scan done")
+except Exception as e:
+    print(f"❌ Entry alert error: {e}")
+
+print("🚀 Running squeeze alert scan...")
+try:
+    check_squeeze_alert()
+    print("✅ Squeeze alert scan done")
+except Exception as e:
+    print(f"❌ Squeeze alert error: {e}")
+
+print("🚀 Running warroom scan...")
+try:
+    check_warroom_simple()
+    print("✅ Warroom scan done")
+except Exception as e:
+    print(f"❌ Warroom error: {e}")
+EOF
