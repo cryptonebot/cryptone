@@ -1,5 +1,5 @@
 # Cryptone V4.5 — zero-fee stack
-# Python 3.11+ recommended (GH Actions uses 3.11)
+# Python 3.11+ recommended
 
 # HTTP / async
 aiohttp>=3.9.0
@@ -9,12 +9,12 @@ websockets>=12.0
 pandas>=2.1.0
 numpy>=1.26.0
 
-# Charts (Telegram signal cards)
+# Charts
 matplotlib>=3.8.0
 mplfinance>=0.12.10b0
 
-# LLM
-google-generativeai>=0.8.0
+# Gemini Interactions API
+google-genai>=1.0.0
 
 # Utilities
 python-dateutil>=2.8.2
