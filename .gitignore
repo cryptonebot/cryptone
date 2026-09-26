@@ -1,0 +1,46 @@
+# Runtime
+data/*.db
+data/*.db-*
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+*.pyc
+__pycache__/
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+logs/
+tmp/
+.keepalive
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Local artifacts
+*.png
+*.jpg
+chart_*.png
