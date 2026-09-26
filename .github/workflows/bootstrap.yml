@@ -1,0 +1,74 @@
+name: Cryptone Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Lookback days (7–90)'
+        required: false
+        default: '30'
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Mkdir data
+        run: mkdir -p ./data
+
+      - name: Download DB
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          name: cryptone-db
+          path: ./data
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow_search: true
+          search_artifacts: true
+          check_artifacts: true
+          workflow_conclusion: success
+          if_no_artifact_found: warn
+
+      - name: Normalize DB path
+        run: |
+          echo "=== tree ./data ==="
+          find ./data -type f 2>/dev/null | head -40 || true
+          if [ ! -f ./data/cryptone_v45.db ]; then
+            FOUND=$(find ./data -name 'cryptone_v45.db' -type f 2>/dev/null | head -1 || true)
+            if [ -n "$FOUND" ]; then
+              echo "Moving $FOUND -> ./data/cryptone_v45.db"
+              mv "$FOUND" ./data/cryptone_v45.db
+            else
+              echo "No previous DB — fresh bootstrap"
+            fi
+          fi
+          ls -la ./data || true
+
+      - name: Bootstrap history
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CRYPTONE_DB_PATH: ./data/cryptone_v45.db
+        run: |
+          DAYS="${{ github.event.inputs.days || '30' }}"
+          python cryptone_v45.py --bootstrap --days "$DAYS"
+          ls -la ./data/cryptone_v45.db
+          python -c "import sqlite3;c=sqlite3.connect('./data/cryptone_v45.db');print('meta',c.execute('SELECT * FROM bootstrap_meta').fetchall());print('fund',c.execute('SELECT COUNT(*) FROM metric_funding').fetchone()[0]);print('atr',c.execute('SELECT COUNT(*) FROM metric_atr').fetchone()[0]);c.close()"
+
+      - name: Upload DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cryptone-db
+          path: ./data/cryptone_v45.db
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 6
