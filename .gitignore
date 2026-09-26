@@ -32,7 +32,7 @@ Thumbs.db
 *.log
 logs/
 tmp/
-.keepalive
+# NOTE: .keepalive must NOT be ignored — Keep-Alive workflow commits it
 
 # Test / coverage
 .coverage
