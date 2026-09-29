@@ -66,11 +66,12 @@ jobs:
       - name: Merge DB sources (cache vs artifact — pilih yang lebih kaya)
         run: |
           mkdir -p ./data
-          python - <<'PY'
-          import os, shutil, sqlite3
+          python <<'PY'
+          import shutil
+          import sqlite3
           from pathlib import Path
 
-          def score(path: Path) -> tuple:
+          def score(path: Path):
               if not path.is_file() or path.stat().st_size < 1024:
                   return (-1, 0, 0, 0)
               try:
@@ -80,56 +81,94 @@ jobs:
                           return int((c.execute(q).fetchone() or [0])[0])
                       except Exception:
                           return 0
-                  t = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-                  sig = n("SELECT COUNT(*) FROM signal_history") if "signal_history" in t else 0
-                  res = n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL") if "signal_history" in t else 0
-                  fund = n("SELECT COUNT(*) FROM metric_funding") if "metric_funding" in t else 0
-                  atr = n("SELECT COUNT(*) FROM metric_atr") if "metric_atr" in t else 0
+                  tables = {
+                      r[0]
+                      for r in c.execute(
+                          "SELECT name FROM sqlite_master WHERE type='table'"
+                      )
+                  }
+                  sig = n("SELECT COUNT(*) FROM signal_history") if "signal_history" in tables else 0
+                  res = (
+                      n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL")
+                      if "signal_history" in tables
+                      else 0
+                  )
+                  fund = n("SELECT COUNT(*) FROM metric_funding") if "metric_funding" in tables else 0
+                  atr = n("SELECT COUNT(*) FROM metric_atr") if "metric_atr" in tables else 0
                   c.close()
-                  # prioritas: resolved outcomes > signals > fund+atr
                   return (res, sig, fund + atr, path.stat().st_size)
               except Exception as e:
-                  print("score fail", path, e)
+                  print("score fail", path, type(e).__name__, e)
                   return (-1, 0, 0, 0)
 
           candidates = []
-          for p in [
-              Path("./data/cryptone_v45.db"),  # cache restore
-              *Path("./data/artifact_dl").rglob("cryptone_v45.db") if Path("./data/artifact_dl").exists() else [],
-          ]:
-              if p.is_file():
-                  candidates.append(p)
+          cache_db = Path("./data/cryptone_v45.db")
+          if cache_db.is_file():
+              candidates.append(cache_db)
+          art_root = Path("./data/artifact_dl")
+          if art_root.exists():
+              candidates.extend(art_root.rglob("cryptone_v45.db"))
 
           if not candidates:
               print("NO DB from cache or artifact — bot will auto-bootstrap")
               raise SystemExit(0)
 
-          ranked = sorted(((score(p), p) for p in candidates), key=lambda x: x[0], reverse=True)
+          ranked = sorted(
+              ((score(p), p) for p in candidates),
+              key=lambda x: x[0],
+              reverse=True,
+          )
           for sc, p in ranked:
               print(f"candidate {p} score={sc}")
+
           best_sc, best = ranked[0]
           dest = Path("./data/cryptone_v45.db")
+          dest.parent.mkdir(parents=True, exist_ok=True)
           if best.resolve() != dest.resolve():
-              dest.parent.mkdir(parents=True, exist_ok=True)
               shutil.copy2(best, dest)
               print(f"SELECTED {best} -> {dest} score={best_sc}")
           else:
               print(f"SELECTED cache DB score={best_sc}")
 
           c = sqlite3.connect(str(dest))
-          c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+          try:
+              c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+          except Exception:
+              pass
+
           def n(q):
               try:
                   return int((c.execute(q).fetchone() or [0])[0])
               except Exception:
                   return 0
-          t = [r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")]
-          print("FINAL tables", sorted(t))
-          print("FINAL signals", n("SELECT COUNT(*) FROM signal_history") if "signal_history" in t else 0)
-          print("FINAL resolved", n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL") if "signal_history" in t else 0)
-          print("FINAL funding", n("SELECT COUNT(*) FROM metric_funding") if "metric_funding" in t else 0)
-          print("FINAL atr", n("SELECT COUNT(*) FROM metric_atr") if "metric_atr" in t else 0)
-          print("FINAL oi", n("SELECT COUNT(*) FROM metric_oi") if "metric_oi" in t else 0)
+
+          tables = {
+              r[0]
+              for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+          }
+          print("FINAL tables", sorted(tables))
+          print(
+              "FINAL signals",
+              n("SELECT COUNT(*) FROM signal_history") if "signal_history" in tables else 0,
+          )
+          print(
+              "FINAL resolved",
+              n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL")
+              if "signal_history" in tables
+              else 0,
+          )
+          print(
+              "FINAL funding",
+              n("SELECT COUNT(*) FROM metric_funding") if "metric_funding" in tables else 0,
+          )
+          print(
+              "FINAL atr",
+              n("SELECT COUNT(*) FROM metric_atr") if "metric_atr" in tables else 0,
+          )
+          print(
+              "FINAL oi",
+              n("SELECT COUNT(*) FROM metric_oi") if "metric_oi" in tables else 0,
+          )
           c.close()
           PY
 
