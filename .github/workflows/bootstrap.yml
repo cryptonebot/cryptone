@@ -12,6 +12,10 @@ jobs:
   bootstrap:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      actions: write
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,6 +29,7 @@ jobs:
       - name: Mkdir data
         run: mkdir -p ./data
 
+      # Ambil DB terakhir (dari bootstrap/live sebelumnya) biar bisa resume / extend.
       - name: Download DB
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -35,7 +40,7 @@ jobs:
           workflow_search: true
           search_artifacts: true
           check_artifacts: true
-          workflow_conclusion: success
+          workflow_conclusion: completed
           if_no_artifact_found: warn
 
       - name: Normalize DB path
@@ -52,6 +57,9 @@ jobs:
             fi
           fi
           ls -la ./data || true
+          if [ -f ./data/cryptone_v45.db ]; then
+            python -c 'import sqlite3;c=sqlite3.connect("./data/cryptone_v45.db");n=lambda q:(c.execute(q).fetchone() or [0])[0];print("pre-bootstrap signals",n("SELECT COUNT(*) FROM signal_history"));print("pre-bootstrap resolved",n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL"));print("pre-bootstrap fund",n("SELECT COUNT(*) FROM metric_funding"));c.close()' || true
+          fi
 
       - name: Bootstrap history
         env:
@@ -61,7 +69,7 @@ jobs:
           DAYS="${{ github.event.inputs.days || '30' }}"
           python cryptone_v45.py --bootstrap --days "$DAYS"
           ls -la ./data/cryptone_v45.db
-          python -c "import sqlite3;c=sqlite3.connect('./data/cryptone_v45.db');print('meta',c.execute('SELECT * FROM bootstrap_meta').fetchall());print('fund',c.execute('SELECT COUNT(*) FROM metric_funding').fetchone()[0]);print('atr',c.execute('SELECT COUNT(*) FROM metric_atr').fetchone()[0]);c.close()"
+          python -c "import sqlite3;c=sqlite3.connect('./data/cryptone_v45.db');print('meta',c.execute('SELECT * FROM bootstrap_meta').fetchall());print('fund',c.execute('SELECT COUNT(*) FROM metric_funding').fetchone()[0]);print('atr',c.execute('SELECT COUNT(*) FROM metric_atr').fetchone()[0]);print('signals',c.execute('SELECT COUNT(*) FROM signal_history').fetchone()[0]);print('resolved',c.execute(\"SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL\").fetchone()[0]);c.close()"
 
       - name: Upload DB
         if: always()
