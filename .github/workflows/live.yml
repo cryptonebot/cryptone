@@ -196,14 +196,63 @@ jobs:
               n("SELECT COUNT(*) FROM metric_oi") if "metric_oi" in tables else 0,
           )
           c.close()
-          # Jangan teruskan DB corrupt ke bot/cache — hentikan di merge
-          if not ic_ok and (sig_n > 0 or dest.stat().st_size >= 1_000_000):
+          if ic_ok:
+              print("MERGE integrity ok — lanjut")
+          elif sig_n > 0 or dest.stat().st_size >= 1_000_000:
+              # Semua kandidat corrupt tapi ada history → coba sqlite .recover
               print(
-                  "ABORT merge: best candidate CORRUPT dengan history. "
-                  "Cari artifact run lebih lama yang integrity ok, "
-                  "atau recover dengan sqlite3 .recover"
+                  "MERGE candidate CORRUPT · mencoba sqlite3 .recover "
+                  "(pin #323 / artifact terbaru sama-sama rusak)"
               )
-              raise SystemExit(1)
+              import subprocess
+              src = dest
+              recovered = Path("./data/cryptone_v45_recovered.db")
+              if recovered.exists():
+                  recovered.unlink()
+              # Dump recoverable pages into new DB
+              proc = subprocess.run(
+                  ["sqlite3", str(src), ".recover"],
+                  capture_output=True,
+                  text=True,
+                  timeout=600,
+              )
+              if proc.returncode != 0 and not proc.stdout:
+                  print("recover stderr:", (proc.stderr or "")[:500])
+                  print("ABORT merge: .recover gagal")
+                  raise SystemExit(1)
+              # Apply SQL dump
+              proc2 = subprocess.run(
+                  ["sqlite3", str(recovered)],
+                  input=proc.stdout,
+                  capture_output=True,
+                  text=True,
+                  timeout=600,
+              )
+              if proc2.returncode != 0:
+                  print("recover apply stderr:", (proc2.stderr or "")[:500])
+                  print("ABORT merge: apply .recover gagal")
+                  raise SystemExit(1)
+              # Verify recovered
+              c2 = sqlite3.connect(str(recovered))
+              try:
+                  row = c2.execute("PRAGMA integrity_check").fetchone()
+                  ok2 = bool(row and row[0] == "ok")
+                  try:
+                      n2 = int(c2.execute("SELECT COUNT(*) FROM signal_history").fetchone()[0])
+                  except Exception:
+                      n2 = -1
+              finally:
+                  c2.close()
+              print("RECOVERED integrity:", "ok" if ok2 else row)
+              print("RECOVERED signals:", n2)
+              if not ok2 or n2 <= 0:
+                  print("ABORT merge: recovered masih jelek")
+                  raise SystemExit(1)
+              import shutil
+              shutil.copy2(recovered, dest)
+              print(f"RECOVERED -> {dest} signals={n2}")
+          else:
+              print("MERGE: no usable DB (empty/corrupt kecil)")
           PY
 
       - name: Guard integrity sebelum bot
