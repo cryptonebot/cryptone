@@ -48,8 +48,19 @@ jobs:
           restore-keys: |
             cryptone-db-v45-
 
-      # 2) Artifact: conclusion=completed (success|cancelled|failure yang sempat upload)
-      #    JANGAN success-only — cancel Live tetap bisa bawa signal_history.
+      # 2a) Pin recovery: Cryptone Live #323 (run_id 44551429374) — DB sebelum corrupt.
+      #     Hapus/nonaktifkan step ini setelah Live stabil pakai artifact baru yang sehat.
+      - name: Download DB pin recovery (#323)
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          name: cryptone-db
+          path: ./data/artifact_pin
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          run_id: 44551429374
+          if_no_artifact_found: warn
+
+      # 2b) Artifact lain (completed). Merge mengutamakan integrity=ok.
       - name: Download DB artifact
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -109,6 +120,10 @@ jobs:
                   return (0, -1, 0, 0, 0)
 
           candidates = []
+          # Pin recovery dulu di list — score integrity tetap yang memutus
+          pin_root = Path("./data/artifact_pin")
+          if pin_root.exists():
+              candidates.extend(pin_root.rglob("cryptone_v45.db"))
           cache_db = Path("./data/cryptone_v45.db")
           if cache_db.is_file():
               candidates.append(cache_db)
@@ -153,11 +168,15 @@ jobs:
               r[0]
               for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")
           }
+          try:
+              ic = c.execute("PRAGMA integrity_check").fetchone()
+              ic_ok = bool(ic and ic[0] == "ok")
+          except Exception:
+              ic_ok = False
+          sig_n = n("SELECT COUNT(*) FROM signal_history") if "signal_history" in tables else 0
           print("FINAL tables", sorted(tables))
-          print(
-              "FINAL signals",
-              n("SELECT COUNT(*) FROM signal_history") if "signal_history" in tables else 0,
-          )
+          print("FINAL integrity", "ok" if ic_ok else "CORRUPT")
+          print("FINAL signals", sig_n)
           print(
               "FINAL resolved",
               n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL")
@@ -177,6 +196,14 @@ jobs:
               n("SELECT COUNT(*) FROM metric_oi") if "metric_oi" in tables else 0,
           )
           c.close()
+          # Jangan teruskan DB corrupt ke bot/cache — hentikan di merge
+          if not ic_ok and (sig_n > 0 or dest.stat().st_size >= 1_000_000):
+              print(
+                  "ABORT merge: best candidate CORRUPT dengan history. "
+                  "Cari artifact run lebih lama yang integrity ok, "
+                  "atau recover dengan sqlite3 .recover"
+              )
+              raise SystemExit(1)
           PY
 
       - name: Guard integrity sebelum bot
@@ -273,8 +300,8 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
 
-      - name: Save DB cache
-        if: always()
+      - name: Save DB cache (hanya DB sehat)
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: |
