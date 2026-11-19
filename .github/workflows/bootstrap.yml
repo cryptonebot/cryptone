@@ -29,37 +29,37 @@ jobs:
       - name: Mkdir data
         run: mkdir -p ./data
 
-      # Ambil DB terakhir (dari bootstrap/live sebelumnya) biar bisa resume / extend.
+      # Ambil DB dari run tertentu (#323 = run 44551429374). Tidak pakai pencarian otomatis.
       - name: Download DB
         uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
         with:
           name: cryptone-db
-          path: ./data
+          path: ./data/artifact_dl
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          workflow_search: true
-          search_artifacts: true
-          check_artifacts: true
-          workflow_conclusion: completed
-          if_no_artifact_found: warn
+          run_id: 44551429374
+          if_no_artifact_found: fail
 
-      - name: Normalize DB path
+      # Pilih file, salin, dan cek integritas. Kalau tidak ok, bootstrap tidak jalan.
+      - name: Siapkan DB dan cek integritas
+        id: prep
         run: |
-          echo "=== tree ./data ==="
-          find ./data -type f 2>/dev/null | head -40 || true
-          if [ ! -f ./data/cryptone_v45.db ]; then
-            FOUND=$(find ./data -name 'cryptone_v45.db' -type f 2>/dev/null | head -1 || true)
-            if [ -n "$FOUND" ]; then
-              echo "Moving $FOUND -> ./data/cryptone_v45.db"
-              mv "$FOUND" ./data/cryptone_v45.db
-            else
-              echo "No previous DB — fresh bootstrap"
-            fi
-          fi
-          ls -la ./data || true
-          if [ -f ./data/cryptone_v45.db ]; then
-            python -c 'import sqlite3;c=sqlite3.connect("./data/cryptone_v45.db");n=lambda q:(c.execute(q).fetchone() or [0])[0];print("pre-bootstrap signals",n("SELECT COUNT(*) FROM signal_history"));print("pre-bootstrap resolved",n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL"));print("pre-bootstrap fund",n("SELECT COUNT(*) FROM metric_funding"));c.close()' || true
-          fi
+          mkdir -p ./data
+          SRC=$(find ./data/artifact_dl -name 'cryptone_v45.db' -type f | head -1)
+          if [ -z "$SRC" ]; then echo "ABORT: cryptone_v45.db tidak ditemukan di artifact"; exit 1; fi
+          cp "$SRC" ./data/cryptone_v45.db
+          python - <<'PY'
+          import sqlite3, sys
+          c = sqlite3.connect("./data/cryptone_v45.db")
+          row = c.execute("PRAGMA integrity_check").fetchone()
+          print("integrity_check:", row)
+          if not row or row[0] != "ok":
+              print("ABORT: integrity_check bukan ok, bootstrap tidak dijalankan")
+              sys.exit(1)
+          n = c.execute("SELECT COUNT(*) FROM signal_history").fetchone()[0]
+          print("pre-bootstrap signal_history =", n)
+          c.close()
+          open("pre_count.txt", "w").write(str(n))
+          PY
 
       - name: Bootstrap history
         env:
@@ -68,11 +68,29 @@ jobs:
         run: |
           DAYS="${{ github.event.inputs.days || '30' }}"
           python cryptone_v45.py --bootstrap --days "$DAYS"
-          ls -la ./data/cryptone_v45.db
           python -c "import sqlite3;c=sqlite3.connect('./data/cryptone_v45.db');print('meta',c.execute('SELECT * FROM bootstrap_meta').fetchall());print('fund',c.execute('SELECT COUNT(*) FROM metric_funding').fetchone()[0]);print('atr',c.execute('SELECT COUNT(*) FROM metric_atr').fetchone()[0]);print('signals',c.execute('SELECT COUNT(*) FROM signal_history').fetchone()[0]);print('resolved',c.execute(\"SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL\").fetchone()[0]);c.close()"
 
+      # Hasil hanya boleh diupload kalau integritas ok dan jumlah sinyal tidak turun.
+      - name: Guard hasil sebelum upload
+        id: post
+        if: success()
+        run: |
+          python - <<'PY'
+          import sqlite3, sys
+          pre = int(open("pre_count.txt").read().strip() or 0)
+          c = sqlite3.connect("./data/cryptone_v45.db")
+          row = c.execute("PRAGMA integrity_check").fetchone()
+          n = c.execute("SELECT COUNT(*) FROM signal_history").fetchone()[0]
+          c.close()
+          print("post signal_history =", n, "pre =", pre, "integrity =", row)
+          if not row or row[0] != "ok" or n < pre:
+              print("ABORT: hasil bootstrap mencurigakan, tidak diupload")
+              sys.exit(1)
+          PY
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
       - name: Upload DB
-        if: always()
+        if: success() && steps.post.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cryptone-db
