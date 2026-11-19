@@ -29,7 +29,7 @@ jobs:
       - name: Mkdir data
         run: mkdir -p ./data
 
-      # Ambil DB dari run tertentu (#323 = run 44551429374). Tidak pakai pencarian otomatis.
+      # Ambil DB dari run tertentu. Ganti run_id ke artifact sehat terakhir jika perlu.
       - name: Download DB
         uses: dawidd6/action-download-artifact@v6
         with:
@@ -39,7 +39,6 @@ jobs:
           run_id: 44551429374
           if_no_artifact_found: fail
 
-      # Pilih file, salin, dan cek integritas. Kalau tidak ok, bootstrap tidak jalan.
       - name: Siapkan DB dan cek integritas
         id: prep
         run: |
@@ -70,7 +69,6 @@ jobs:
           python cryptone_v45.py --bootstrap --days "$DAYS"
           python -c "import sqlite3;c=sqlite3.connect('./data/cryptone_v45.db');print('meta',c.execute('SELECT * FROM bootstrap_meta').fetchall());print('fund',c.execute('SELECT COUNT(*) FROM metric_funding').fetchone()[0]);print('atr',c.execute('SELECT COUNT(*) FROM metric_atr').fetchone()[0]);print('signals',c.execute('SELECT COUNT(*) FROM signal_history').fetchone()[0]);print('resolved',c.execute(\"SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL\").fetchone()[0]);c.close()"
 
-      # Hasil hanya boleh diupload kalau integritas ok dan jumlah sinyal tidak turun.
       - name: Guard hasil sebelum upload
         id: post
         if: success()
@@ -98,3 +96,4 @@ jobs:
           retention-days: 14
           if-no-files-found: error
           compression-level: 6
+          
