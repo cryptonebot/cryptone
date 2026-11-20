@@ -17,7 +17,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    # FIX #4: naikkan timeout ke 360m (max hosted runner) supaya bot 330m
+    # masih punya ~30m buffer untuk install, restore, merge, .recover, upload, cache.
+    timeout-minutes: 360
     permissions:
       actions: write
       contents: read
@@ -32,6 +34,16 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      # Safety: sqlite3 CLI untuk .recover. Biasanya sudah ada di ubuntu-latest,
+      # step ini idempotent kalau memang sudah terpasang.
+      - name: Ensure sqlite3 CLI
+        run: |
+          if ! command -v sqlite3 >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y sqlite3
+          fi
+          sqlite3 --version
+
+      # FIX #7: Mkdir data SEBELUM cache restore supaya path selalu ada.
       - name: Mkdir data
         run: mkdir -p ./data
 
@@ -48,8 +60,10 @@ jobs:
           restore-keys: |
             cryptone-db-v45-
 
-      # 2a) Pin recovery: Cryptone Live #323 (run_id 44551429374) — DB sebelum corrupt.
-      #     Hapus/nonaktifkan step ini setelah Live stabil pakai artifact baru yang sehat.
+      # 2a) Pin recovery: Cryptone Live #323 (run_id 44551429374).
+      #     Per 20/11: #323 terbukti corrupt (integrity != ok). Tetap di-download
+      #     supaya bisa dipakai sebagai sumber .recover, tapi tidak akan dipilih
+      #     selama ada kandidat yang integrity ok.
       - name: Download DB pin recovery (#323)
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -61,6 +75,8 @@ jobs:
           if_no_artifact_found: warn
 
       # 2b) Artifact lain (completed). Merge mengutamakan integrity=ok.
+      # FIX #10: batasi ke branch aktif (default branch pada schedule) supaya
+      # tidak kontaminasi dari PR/fork/feature branch lain.
       - name: Download DB artifact
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -72,12 +88,18 @@ jobs:
           search_artifacts: true
           check_artifacts: true
           workflow_conclusion: completed
+          branch: ${{ github.ref_name }}
           if_no_artifact_found: warn
 
       - name: Merge DB sources (cache vs artifact — pilih yang lebih kaya)
+        env:
+          # FIX #11: default "0" = abort kalau tidak ada DB sama sekali dan
+          # tidak ada indikasi history. Set "1" HANYA untuk first-run bootstrap.
+          CRYPTONE_MERGE_ALLOW_BOOTSTRAP: "0"
         run: |
-          mkdir -p ./data
           python <<'PY'
+          import os
+          import re
           import shutil
           import sqlite3
           from pathlib import Path
@@ -120,7 +142,6 @@ jobs:
                   return (0, -1, 0, 0, 0)
 
           candidates = []
-          # Pin recovery dulu di list — score integrity tetap yang memutus
           pin_root = Path("./data/artifact_pin")
           if pin_root.exists():
               candidates.extend(pin_root.rglob("cryptone_v45.db"))
@@ -132,8 +153,13 @@ jobs:
               candidates.extend(art_root.rglob("cryptone_v45.db"))
 
           if not candidates:
-              print("NO DB from cache or artifact — bot will auto-bootstrap")
-              raise SystemExit(0)
+              allow = os.environ.get("CRYPTONE_MERGE_ALLOW_BOOTSTRAP", "0") == "1"
+              if allow:
+                  print("NO DB — bootstrap allowed, bot akan auto-bootstrap")
+                  raise SystemExit(0)
+              print("ABORT merge: NO DB from cache or artifact and bootstrap disallowed")
+              print("  → Set CRYPTONE_MERGE_ALLOW_BOOTSTRAP=1 untuk first-run bootstrap yang sah.")
+              raise SystemExit(1)
 
           ranked = sorted(
               ((score(p), p) for p in candidates),
@@ -199,7 +225,6 @@ jobs:
           if ic_ok:
               print("MERGE integrity ok — lanjut")
           elif sig_n > 0 or dest.stat().st_size >= 1_000_000:
-              # Semua kandidat corrupt tapi ada history → coba sqlite .recover
               print(
                   "MERGE candidate CORRUPT · mencoba sqlite3 .recover "
                   "(pin #323 / artifact terbaru sama-sama rusak)"
@@ -209,21 +234,34 @@ jobs:
               recovered = Path("./data/cryptone_v45_recovered.db")
               if recovered.exists():
                   recovered.unlink()
-              # Dump recoverable pages into new DB
               proc = subprocess.run(
                   ["sqlite3", str(src), ".recover"],
                   capture_output=True,
                   text=True,
                   timeout=600,
               )
-              if proc.returncode != 0 and not proc.stdout:
+              # FIX #6: filter sqlite_sequence pakai regex prefix (bukan substring)
+              # supaya tidak buang baris data yang mengandung kata itu.
+              seq_pat = re.compile(
+                  r'^\s*(?:'
+                  r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?sqlite_sequence\b'
+                  r'|INSERT\s+INTO\s+sqlite_sequence\b'
+                  r'|DELETE\s+FROM\s+sqlite_sequence\b'
+                  r'|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?sqlite_sequence\b'
+                  r')',
+                  re.I,
+              )
+              dump = "".join(
+                  line for line in proc.stdout.splitlines(True)
+                  if not seq_pat.match(line)
+              )
+              if proc.returncode != 0 and not dump:
                   print("recover stderr:", (proc.stderr or "")[:500])
                   print("ABORT merge: .recover gagal")
                   raise SystemExit(1)
-              # Apply SQL dump
               proc2 = subprocess.run(
                   ["sqlite3", str(recovered)],
-                  input=proc.stdout,
+                  input=dump,
                   capture_output=True,
                   text=True,
                   timeout=600,
@@ -232,7 +270,6 @@ jobs:
                   print("recover apply stderr:", (proc2.stderr or "")[:500])
                   print("ABORT merge: apply .recover gagal")
                   raise SystemExit(1)
-              # Verify recovered
               c2 = sqlite3.connect(str(recovered))
               try:
                   row = c2.execute("PRAGMA integrity_check").fetchone()
@@ -248,7 +285,6 @@ jobs:
               if not ok2 or n2 <= 0:
                   print("ABORT merge: recovered masih jelek")
                   raise SystemExit(1)
-              import shutil
               shutil.copy2(recovered, dest)
               print(f"RECOVERED -> {dest} signals={n2}")
           else:
@@ -278,7 +314,6 @@ jobs:
               print("signals:", n, "size_mb:", round(p.stat().st_size/1e6, 2))
               open("guard_signals.txt","w").write(str(n))
               if not row or row[0] != "ok":
-                  # Corrupt: jangan jalankan bot (hindari create_fresh / bootstrap kosong)
                   if n != 0 or p.stat().st_size >= 1_000_000:
                       print("ABORT: DB corrupt dengan indikasi history — perbaiki artifact dulu")
                       sys.exit(1)
@@ -313,34 +348,46 @@ jobs:
             echo "No DB to checkpoint"
           fi
 
-      - name: Upload DB artifact (hanya jika integrity ok)
+      # FIX #1: gate jadi output step (selalu exit 0), upload/cache diputuskan
+      # dari output ini — bukan dari success(), supaya gate yang "no" tidak
+      # mematikan upload ketika DB sebenarnya sehat tapi step lain gagal.
+      - name: Upload gate
+        id: upload_gate
         if: always()
         run: |
           python <<'PY'
-          import sqlite3, sys
+          import os, sqlite3
           from pathlib import Path
           p = Path("./data/cryptone_v45.db")
-          if not p.is_file():
-              print("skip upload: no db")
-              sys.exit(0)
-          c = sqlite3.connect(str(p))
-          row = c.execute("PRAGMA integrity_check").fetchone()
-          try:
-              n = int(c.execute("SELECT COUNT(*) FROM signal_history").fetchone()[0])
-          except Exception:
-              n = -1
-          c.close()
-          print("upload_gate integrity=", row, "signals=", n)
-          if not row or row[0] != "ok":
-              print("ABORT upload: DB corrupt — jangan timpa artifact sehat")
-              sys.exit(1)
-          if n == 0:
-              print("ABORT upload: signals=0 — kemungkinan wipe/bootstrap kosong")
-              sys.exit(1)
-          print("upload_gate ok")
+          ok = False
+          reason = "no_db"
+          if p.is_file():
+              c = sqlite3.connect(str(p))
+              try:
+                  row = c.execute("PRAGMA integrity_check").fetchone()
+                  try:
+                      n = int(c.execute("SELECT COUNT(*) FROM signal_history").fetchone()[0])
+                  except Exception:
+                      n = -1
+                  integ_ok = bool(row and row[0] == "ok")
+                  print(f"upload_gate integrity={row} signals={n}")
+                  if not integ_ok:
+                      reason = "corrupt"
+                  elif n <= 0:
+                      reason = "signals_zero"
+                  else:
+                      ok = True
+                      reason = "ok"
+              finally:
+                  c.close()
+          print(f"upload_gate ok={ok} reason={reason}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"ok={'true' if ok else 'false'}\n")
+              f.write(f"reason={reason}\n")
           PY
+
       - name: Upload DB artifact
-        if: success()
+        if: always() && steps.upload_gate.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cryptone-db
@@ -350,10 +397,9 @@ jobs:
           compression-level: 6
 
       - name: Save DB cache (hanya DB sehat)
-        if: success()
+        if: always() && steps.upload_gate.outputs.ok == 'true'
         uses: actions/cache/save@v4
         with:
           path: |
             ./data/cryptone_v45.db
           key: cryptone-db-v45-${{ github.run_id }}
-          
