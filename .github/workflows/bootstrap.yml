@@ -8,10 +8,22 @@ on:
         required: false
         default: '30'
 
+concurrency:
+  # Grup sama dengan Live: keduanya menulis DB dan artifact "cryptone-db" yang sama.
+  # cancel-in-progress: false → bootstrap ANTRE di belakang Live, tidak membunuhnya.
+  group: cryptone-live
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   bootstrap:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # FIX: naik dari 45m → 90m. Bootstrap 30–90 hari × banyak simbol (API rate limits,
+    # retry, sleep antar batch) bisa memakan waktu jauh lebih lama dari 45m.
+    timeout-minutes: 90
     permissions:
       actions: write
       contents: read
@@ -29,14 +41,39 @@ jobs:
       - name: Mkdir data
         run: mkdir -p ./data
 
-      # Ambil DB dari run tertentu. Ganti run_id ke artifact sehat terakhir jika perlu.
-      - name: Download DB
+      # Validasi input days (7–90). Input dikirim lewat env, bukan interpolasi
+      # langsung ke script, supaya tidak ada injection dari nilai input.
+      - name: Validasi days
+        id: validate
+        env:
+          DAYS_IN: ${{ github.event.inputs.days }}
+        run: |
+          DAYS="${DAYS_IN:-30}"
+          if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || [ "$DAYS" -lt 7 ] || [ "$DAYS" -gt 90 ]; then
+            echo "ABORT: days harus angka 7–90, dapat '$DAYS'"
+            exit 1
+          fi
+          echo "days=$DAYS" >> "$GITHUB_OUTPUT"
+          echo "days=$DAYS"
+
+      # CATATAN: bootstrap WAJIB punya artifact DB sehat sebagai basis — karena
+      # tujuannya memperluas history (bukan membuat DB kosong dari nol).
+      # Untuk deploy pertama: jalankan Live sekali dulu dengan
+      # CRYPTONE_MERGE_ALLOW_BOOTSTRAP="1", biarkan upload artifact sehat,
+      # baru jalankan Bootstrap ini.
+      # Ambil artifact terakhir yang lolos upload gate (integrity ok). Tidak lagi
+      # hardcode run_id, karena run_id lama (#323) sudah terbukti corrupt.
+      - name: Download DB artifact
         uses: dawidd6/action-download-artifact@v6
         with:
           name: cryptone-db
           path: ./data/artifact_dl
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          run_id: 44551429374
+          workflow_search: true
+          search_artifacts: true
+          check_artifacts: true
+          workflow_conclusion: completed
+          branch: ${{ github.ref_name }}
           if_no_artifact_found: fail
 
       - name: Siapkan DB dan cek integritas
@@ -64,31 +101,65 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           CRYPTONE_DB_PATH: ./data/cryptone_v45.db
+          DAYS: ${{ steps.validate.outputs.days }}
         run: |
-          DAYS="${{ github.event.inputs.days || '30' }}"
           python cryptone_v45.py --bootstrap --days "$DAYS"
-          python -c "import sqlite3;c=sqlite3.connect('./data/cryptone_v45.db');print('meta',c.execute('SELECT * FROM bootstrap_meta').fetchall());print('fund',c.execute('SELECT COUNT(*) FROM metric_funding').fetchone()[0]);print('atr',c.execute('SELECT COUNT(*) FROM metric_atr').fetchone()[0]);print('signals',c.execute('SELECT COUNT(*) FROM signal_history').fetchone()[0]);print('resolved',c.execute(\"SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL\").fetchone()[0]);c.close()"
+          python - <<'PY'
+          import sqlite3
+          c = sqlite3.connect("./data/cryptone_v45.db")
+          def n(q):
+              return c.execute(q).fetchone()[0]
+          print("meta", c.execute("SELECT * FROM bootstrap_meta").fetchall())
+          print("fund", n("SELECT COUNT(*) FROM metric_funding"))
+          print("atr", n("SELECT COUNT(*) FROM metric_atr"))
+          print("signals", n("SELECT COUNT(*) FROM signal_history"))
+          print("resolved", n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL"))
+          c.close()
+          PY
+
+      # WAL harus di-checkpoint sebelum upload. Artifact hanya berisi file .db,
+      # jadi frame yang masih di -wal akan HILANG kalau tidak di-checkpoint dulu.
+      - name: Checkpoint DB
+        run: |
+          python - <<'PY'
+          import sqlite3, sys
+          c = sqlite3.connect("./data/cryptone_v45.db")
+          row = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+          print("wal_checkpoint(TRUNCATE) =", row)
+          c.close()
+          # row = (busy, log, checkpointed). busy != 0 = tidak semua frame ter-flush.
+          if row and row[0] != 0:
+              print("ABORT: checkpoint belum penuh (busy)")
+              sys.exit(1)
+          PY
 
       - name: Guard hasil sebelum upload
         id: post
         if: success()
         run: |
           python - <<'PY'
-          import sqlite3, sys
+          import os, sqlite3, sys
+          from pathlib import Path
           pre = int(open("pre_count.txt").read().strip() or 0)
-          c = sqlite3.connect("./data/cryptone_v45.db")
+          p = Path("./data/cryptone_v45.db")
+          c = sqlite3.connect(str(p))
           row = c.execute("PRAGMA integrity_check").fetchone()
           n = c.execute("SELECT COUNT(*) FROM signal_history").fetchone()[0]
           c.close()
           print("post signal_history =", n, "pre =", pre, "integrity =", row)
-          if not row or row[0] != "ok" or n < pre:
+          ok = bool(row and row[0] == "ok" and n >= pre and n > 0)
+          if not ok:
               print("ABORT: hasil bootstrap mencurigakan, tidak diupload")
               sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("ok=true\n")
           PY
-          echo "ok=true" >> "$GITHUB_OUTPUT"
 
+      # FIX: pakai always() + output gate (bukan success() && output) supaya
+      # intent-nya eksplisit: upload HANYA kalau gate bilang ok=true. Kalau
+      # step sebelum gate gagal, gate di-skip → output kosong → tetap tidak upload.
       - name: Upload DB
-        if: success() && steps.post.outputs.ok == 'true'
+        if: always() && steps.post.outputs.ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cryptone-db
@@ -96,4 +167,3 @@ jobs:
           retention-days: 14
           if-no-files-found: error
           compression-level: 6
-          
