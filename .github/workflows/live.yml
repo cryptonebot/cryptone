@@ -6,9 +6,11 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # Satu grup bersama Bootstrap: keduanya menulis DB yang sama dan artifact yang sama.
+  # cancel-in-progress: false → run baru ANTRE, tidak membunuh run yang sedang
+  # menulis DB (SIGKILL di tengah write adalah penyebab corrupt yang paling mungkin).
   group: cryptone-live
-  # true = 1 Live at a time. Parallel Live → same bootstrap DB → re-fire spam.
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   actions: read
@@ -17,8 +19,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # FIX #4: naikkan timeout ke 360m (max hosted runner) supaya bot 330m
-    # masih punya ~30m buffer untuk install, restore, merge, .recover, upload, cache.
+    # Bot max-runtime 19800s (330m). Job timeout 360m (maksimum runner hosted)
+    # supaya bot selesai dengan rapi dulu, baru checkpoint/gate/upload berjalan.
     timeout-minutes: 360
     permissions:
       actions: write
@@ -34,8 +36,6 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      # Safety: sqlite3 CLI untuk .recover. Biasanya sudah ada di ubuntu-latest,
-      # step ini idempotent kalau memang sudah terpasang.
       - name: Ensure sqlite3 CLI
         run: |
           if ! command -v sqlite3 >/dev/null; then
@@ -43,11 +43,10 @@ jobs:
           fi
           sqlite3 --version
 
-      # FIX #7: Mkdir data SEBELUM cache restore supaya path selalu ada.
       - name: Mkdir data
         run: mkdir -p ./data
 
-      # 1) Cache restore (cepat, survive cancel lebih baik dari artifact success-only)
+      # Cache hanya berisi .db (WAL di-checkpoint sebelum save), jadi restore cukup .db.
       - name: Restore DB cache
         id: cache-db
         uses: actions/cache/restore@v4
@@ -60,23 +59,8 @@ jobs:
           restore-keys: |
             cryptone-db-v45-
 
-      # 2a) Pin recovery: Cryptone Live #323 (run_id 44551429374).
-      #     Per 20/11: #323 terbukti corrupt (integrity != ok). Tetap di-download
-      #     supaya bisa dipakai sebagai sumber .recover, tapi tidak akan dipilih
-      #     selama ada kandidat yang integrity ok.
-      - name: Download DB pin recovery (#323)
-        uses: dawidd6/action-download-artifact@v6
-        continue-on-error: true
-        with:
-          name: cryptone-db
-          path: ./data/artifact_pin
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          run_id: 44551429374
-          if_no_artifact_found: warn
-
-      # 2b) Artifact lain (completed). Merge mengutamakan integrity=ok.
-      # FIX #10: batasi ke branch aktif (default branch pada schedule) supaya
-      # tidak kontaminasi dari PR/fork/feature branch lain.
+      # Artifact terakhir yang lolos upload gate (integrity ok, signals > 0).
+      # Karena gate mencegah DB rusak diupload, artifact terbaru selalu sehat.
       - name: Download DB artifact
         uses: dawidd6/action-download-artifact@v6
         continue-on-error: true
@@ -91,10 +75,9 @@ jobs:
           branch: ${{ github.ref_name }}
           if_no_artifact_found: warn
 
-      - name: Merge DB sources (cache vs artifact — pilih yang lebih kaya)
+      - name: Merge DB sources (cache vs artifact, pilih integrity ok terbaik)
         env:
-          # FIX #11: default "0" = abort kalau tidak ada DB sama sekali dan
-          # tidak ada indikasi history. Set "1" HANYA untuk first-run bootstrap.
+          # Default 0: abort kalau tidak ada DB sama sekali. Set 1 HANYA untuk first-run.
           CRYPTONE_MERGE_ALLOW_BOOTSTRAP: "0"
         run: |
           python <<'PY'
@@ -102,11 +85,11 @@ jobs:
           import re
           import shutil
           import sqlite3
+          import subprocess
           from pathlib import Path
 
           def score(path: Path):
-              # Tuple: (integrity_ok, resolved, signals, metrics, size)
-              # integrity_ok diutamakan — DB corrupt 12k sinyal kalah dari DB sehat 10k.
+              # (integrity_ok, resolved, signals, metrics, size)
               if not path.is_file() or path.stat().st_size < 1024:
                   return (0, -1, 0, 0, 0)
               try:
@@ -121,18 +104,14 @@ jobs:
                       ok = 1 if (ic and ic[0] == "ok") else 0
                   except Exception:
                       ok = 0
-                  tables = {
-                      r[0]
-                      for r in c.execute(
-                          "SELECT name FROM sqlite_master WHERE type='table'"
-                      )
-                  }
+                  try:
+                      tables = {r[0] for r in c.execute(
+                          "SELECT name FROM sqlite_master WHERE type='table'")}
+                  except Exception:
+                      tables = set()
                   sig = n("SELECT COUNT(*) FROM signal_history") if "signal_history" in tables else 0
-                  res = (
-                      n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL")
-                      if "signal_history" in tables
-                      else 0
-                  )
+                  res = (n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL")
+                         if "signal_history" in tables else 0)
                   fund = n("SELECT COUNT(*) FROM metric_funding") if "metric_funding" in tables else 0
                   atr = n("SELECT COUNT(*) FROM metric_atr") if "metric_atr" in tables else 0
                   c.close()
@@ -141,10 +120,17 @@ jobs:
                   print("score fail", path, type(e).__name__, e)
                   return (0, -1, 0, 0, 0)
 
+          def count_table(path: Path, table: str):
+              try:
+                  cc = sqlite3.connect(str(path))
+                  try:
+                      return int(cc.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                  finally:
+                      cc.close()
+              except Exception:
+                  return -1
+
           candidates = []
-          pin_root = Path("./data/artifact_pin")
-          if pin_root.exists():
-              candidates.extend(pin_root.rglob("cryptone_v45.db"))
           cache_db = Path("./data/cryptone_v45.db")
           if cache_db.is_file():
               candidates.append(cache_db)
@@ -153,19 +139,15 @@ jobs:
               candidates.extend(art_root.rglob("cryptone_v45.db"))
 
           if not candidates:
-              allow = os.environ.get("CRYPTONE_MERGE_ALLOW_BOOTSTRAP", "0") == "1"
-              if allow:
-                  print("NO DB — bootstrap allowed, bot akan auto-bootstrap")
+              if os.environ.get("CRYPTONE_MERGE_ALLOW_BOOTSTRAP", "0") == "1":
+                  print("NO DB — bootstrap diizinkan, bot akan auto-bootstrap")
                   raise SystemExit(0)
-              print("ABORT merge: NO DB from cache or artifact and bootstrap disallowed")
-              print("  → Set CRYPTONE_MERGE_ALLOW_BOOTSTRAP=1 untuk first-run bootstrap yang sah.")
+              print("ABORT merge: tidak ada DB dari cache maupun artifact")
+              print("  → set CRYPTONE_MERGE_ALLOW_BOOTSTRAP=1 hanya untuk first-run.")
               raise SystemExit(1)
 
-          ranked = sorted(
-              ((score(p), p) for p in candidates),
-              key=lambda x: x[0],
-              reverse=True,
-          )
+          ranked = sorted(((score(p), p) for p in candidates),
+                          key=lambda x: x[0], reverse=True)
           for sc, p in ranked:
               print(f"candidate {p} score={sc}")
 
@@ -190,86 +172,53 @@ jobs:
               except Exception:
                   return 0
 
-          tables = {
-              r[0]
-              for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-          }
+          try:
+              tables = {r[0] for r in c.execute(
+                  "SELECT name FROM sqlite_master WHERE type='table'")}
+          except Exception as e:
+              print("FINAL schema unreadable", type(e).__name__, e)
+              tables = set()
           try:
               ic = c.execute("PRAGMA integrity_check").fetchone()
               ic_ok = bool(ic and ic[0] == "ok")
           except Exception:
               ic_ok = False
           sig_n = n("SELECT COUNT(*) FROM signal_history") if "signal_history" in tables else 0
-          print("FINAL tables", sorted(tables))
           print("FINAL integrity", "ok" if ic_ok else "CORRUPT")
           print("FINAL signals", sig_n)
-          print(
-              "FINAL resolved",
-              n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL")
-              if "signal_history" in tables
-              else 0,
-          )
-          print(
-              "FINAL funding",
-              n("SELECT COUNT(*) FROM metric_funding") if "metric_funding" in tables else 0,
-          )
-          print(
-              "FINAL atr",
-              n("SELECT COUNT(*) FROM metric_atr") if "metric_atr" in tables else 0,
-          )
-          print(
-              "FINAL oi",
-              n("SELECT COUNT(*) FROM metric_oi") if "metric_oi" in tables else 0,
-          )
           c.close()
+
           if ic_ok:
               print("MERGE integrity ok — lanjut")
           elif sig_n > 0 or dest.stat().st_size >= 1_000_000:
-              print(
-                  "MERGE candidate CORRUPT · mencoba sqlite3 .recover "
-                  "(pin #323 / artifact terbaru sama-sama rusak)"
-              )
-              import subprocess
-              src = dest
+              print("MERGE CORRUPT · mencoba sqlite3 .recover")
               recovered = Path("./data/cryptone_v45_recovered.db")
               if recovered.exists():
                   recovered.unlink()
-              proc = subprocess.run(
-                  ["sqlite3", str(src), ".recover"],
-                  capture_output=True,
-                  text=True,
-                  timeout=600,
-              )
-              # FIX #6: filter sqlite_sequence pakai regex prefix (bukan substring)
-              # supaya tidak buang baris data yang mengandung kata itu.
+              proc = subprocess.run(["sqlite3", str(dest), ".recover"],
+                                    capture_output=True, text=True, timeout=900)
+              # Buang statement yang menyentuh sqlite_sequence: nama reserved, dibuat
+              # otomatis oleh SQLite saat tabel AUTOINCREMENT dibuat ulang.
               seq_pat = re.compile(
                   r'^\s*(?:'
                   r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?sqlite_sequence\b'
                   r'|INSERT\s+INTO\s+sqlite_sequence\b'
                   r'|DELETE\s+FROM\s+sqlite_sequence\b'
                   r'|DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?sqlite_sequence\b'
-                  r')',
-                  re.I,
-              )
-              dump = "".join(
-                  line for line in proc.stdout.splitlines(True)
-                  if not seq_pat.match(line)
-              )
-              if proc.returncode != 0 and not dump:
+                  r')', re.I)
+              dump = "".join(line for line in proc.stdout.splitlines(True)
+                             if not seq_pat.match(line))
+              if not dump:
                   print("recover stderr:", (proc.stderr or "")[:500])
-                  print("ABORT merge: .recover gagal")
+                  print("ABORT merge: .recover menghasilkan output kosong")
                   raise SystemExit(1)
-              proc2 = subprocess.run(
-                  ["sqlite3", str(recovered)],
-                  input=dump,
-                  capture_output=True,
-                  text=True,
-                  timeout=600,
-              )
+              proc2 = subprocess.run(["sqlite3", str(recovered)], input=dump,
+                                     capture_output=True, text=True, timeout=900)
               if proc2.returncode != 0:
                   print("recover apply stderr:", (proc2.stderr or "")[:500])
                   print("ABORT merge: apply .recover gagal")
                   raise SystemExit(1)
+
               c2 = sqlite3.connect(str(recovered))
               try:
                   row = c2.execute("PRAGMA integrity_check").fetchone()
@@ -283,24 +232,31 @@ jobs:
               print("RECOVERED integrity:", "ok" if ok2 else row)
               print("RECOVERED signals:", n2)
               if not ok2 or n2 <= 0:
-                  print("ABORT merge: recovered masih jelek")
+                  print("ABORT merge: recovered masih tidak sehat")
                   raise SystemExit(1)
+
+              # Laporan selisih baris per tabel (warn saja, tidak menghentikan run).
+              for t in ["signal_history", "metric_funding", "metric_atr", "metric_oi", "metric_ohlcv"]:
+                  before = count_table(dest, t)
+                  after = count_table(recovered, t)
+                  flag = "" if before == after else "  ← selisih"
+                  print(f"RECOVER COUNT {t}: sebelum={before} sesudah={after}{flag}")
+
               shutil.copy2(recovered, dest)
               print(f"RECOVERED -> {dest} signals={n2}")
           else:
-              print("MERGE: no usable DB (empty/corrupt kecil)")
+              print("MERGE: tidak ada DB yang bisa dipakai (kosong/corrupt kecil)")
+              raise SystemExit(1)
           PY
 
       - name: Guard integrity sebelum bot
-        id: guard
         run: |
           python <<'PY'
           import sqlite3, sys
           from pathlib import Path
           p = Path("./data/cryptone_v45.db")
           if not p.is_file():
-              print("NO DB file — bot may auto-bootstrap if allowed")
-              open("guard_signals.txt","w").write("0")
+              print("NO DB file — bot boleh auto-bootstrap jika diizinkan")
               sys.exit(0)
           c = sqlite3.connect(str(p))
           try:
@@ -311,13 +267,10 @@ jobs:
               except Exception as e:
                   print("COUNT fail:", type(e).__name__)
                   n = -1
-              print("signals:", n, "size_mb:", round(p.stat().st_size/1e6, 2))
-              open("guard_signals.txt","w").write(str(n))
+              print("signals:", n, "size_mb:", round(p.stat().st_size / 1e6, 2))
               if not row or row[0] != "ok":
-                  if n != 0 or p.stat().st_size >= 1_000_000:
-                      print("ABORT: DB corrupt dengan indikasi history — perbaiki artifact dulu")
-                      sys.exit(1)
-                  print("WARN: corrupt kecil tanpa history — bot boleh fresh")
+                  print("ABORT: DB tidak integrity ok — bot tidak dijalankan")
+                  sys.exit(1)
           finally:
               c.close()
           PY
@@ -339,18 +292,36 @@ jobs:
         run: |
           python cryptone_v45.py --live --max-runtime 19800
 
-      - name: Checkpoint DB
+      - name: Checkpoint DB (fail-soft)
         if: always()
         run: |
-          if [ -f ./data/cryptone_v45.db ]; then
-            python -c 'import sqlite3,os;p="./data/cryptone_v45.db";c=sqlite3.connect(p);c.execute("PRAGMA wal_checkpoint(TRUNCATE)");c.close();print("checkpoint ok size",os.path.getsize(p));c=sqlite3.connect(p);n=lambda q:(c.execute(q).fetchone() or [0])[0];print("signals",n("SELECT COUNT(*) FROM signal_history"));print("resolved",n("SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL"));print("oi",n("SELECT COUNT(*) FROM metric_oi"));print("fund",n("SELECT COUNT(*) FROM metric_funding"));c.close()'
-          else
-            echo "No DB to checkpoint"
-          fi
+          python <<'PY'
+          import os, sqlite3
+          from pathlib import Path
+          p = Path("./data/cryptone_v45.db")
+          if not p.is_file():
+              print("No DB to checkpoint")
+              raise SystemExit(0)
+          try:
+              c = sqlite3.connect(str(p))
+              c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+              print("checkpoint ok size", os.path.getsize(p))
+              for label, q in [
+                  ("signals", "SELECT COUNT(*) FROM signal_history"),
+                  ("resolved", "SELECT COUNT(*) FROM signal_history WHERE outcome IS NOT NULL"),
+                  ("oi", "SELECT COUNT(*) FROM metric_oi"),
+                  ("fund", "SELECT COUNT(*) FROM metric_funding"),
+              ]:
+                  try:
+                      print(label, c.execute(q).fetchone()[0])
+                  except Exception as e:
+                      print(label, "ERR", type(e).__name__)
+              c.close()
+          except Exception as e:
+              print("checkpoint skipped:", type(e).__name__, e)
+          PY
 
-      # FIX #1: gate jadi output step (selalu exit 0), upload/cache diputuskan
-      # dari output ini — bukan dari success(), supaya gate yang "no" tidak
-      # mematikan upload ketika DB sebenarnya sehat tapi step lain gagal.
+      # Gate jadi output step. Upload dan cache hanya jalan kalau ok=true.
       - name: Upload gate
         id: upload_gate
         if: always()
@@ -393,10 +364,10 @@ jobs:
           name: cryptone-db
           path: ./data/cryptone_v45.db
           retention-days: 14
-          if-no-files-found: warn
+          if-no-files-found: error
           compression-level: 6
 
-      - name: Save DB cache (hanya DB sehat)
+      - name: Save DB cache
         if: always() && steps.upload_gate.outputs.ok == 'true'
         uses: actions/cache/save@v4
         with:
